@@ -1,0 +1,322 @@
+# mof_whitebox_and_doe_pipeline.py
+import pandas as pd
+import numpy as np
+from pathlib import Path
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import PolynomialFeatures
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+import matplotlib.pyplot as plt
+import textwrap
+import re
+
+# ===================== CONFIGURATION =====================
+# Input / target columns
+FILE_PATH = Path("merged_mof_data_160k_5bar.xlsx")
+
+# Working-capacity targets (both will be modeled)
+GRAV_COL = "Uptake Grav - Working Cap [%wt]"     # for DOE screening & white-box
+VOL_COL  = "Uptake Vol - Working Cap [g/L]"      # for DOE screening & white-box
+TARGETS  = [GRAV_COL, VOL_COL]                   # loop white-box for both
+
+# White-box settings
+DEGREE        = 2            # polynomial degree
+TEST_SIZE     = 0.20         # 80/20 split
+RANDOM_STATE  = 42
+TOP_SCATTER   = 4            # pearson top-N scatter
+USE_RAINBOW   = True         # color Pred-vs-Actual with rainbow cmap
+
+# DOE 2025 targets (tetap, kini dibandingkan dengan working capacity)
+DOE_TARGET_GRAV = 5.5        # wt.%
+DOE_TARGET_VOL  = 40.0       # g H2/L
+DOE_SHOW_PLOTS  = True       # show DOE plots instead of saving PNGs
+
+# Outputs
+OUTDIR = Path("pipeline_outputs")
+OUTDIR.mkdir(parents=True, exist_ok=True)
+# =========================================================
+
+# Feature aliases (tolerant spellings & unicode variants)
+FEATURE_ALIASES = {
+    "density [g/cm³]": [
+        "density [g/cm³]", "density [g/cm^3]", "Density [g/cm³]", "Density [g/cm^3]"
+    ],
+    "asa_grav [m²/g]": [
+        "asa_grav [m²/g]", "asa_grav [m2/g]", "ASA_grav [m²/g]", "ASA grav [m²/g]",
+        "asa grav [m²/g]", "grav_surface_area [m²/g]", "grav SA [m²/g]"
+    ],
+    "asa_vol [m²/cm³]": [
+        "asa_vol [m²/cm³]", "asa_vol [m2/cm3]", "ASA [m^2/cm^3]", "ASA [m²/cm³]",
+        "VSA [m^2/cm^3]", "VSA [m²/cm³]", "vol_surface_area [m^2/cm^3]",
+        "vol_surface_area [m²/cm³]", "Volumetric SA [m^2/cm^3]", "Volumetric SA [m²/cm³]"
+    ],
+    "av_vf": [
+        "av_vf", "avg_vf", "void_fraction", "void fraction", "VF", "av vf"
+    ],
+    "pore_volume [cm³/g]": [
+        "pore_volume [cm³/g]", "pore volume [cm³/g]", "pore_volume [cm^3/g]",
+        "pore volume [cm^3/g]", "POAV [cm^3/g]", "POAV [cm³/g]", "total pore volume [cm³/g]"
+    ],
+    "lcd [Å]": [
+        "lcd [Å]", "LCD [Å]", "lcd [A]", "LCD [A]", "largest_cavity_diameter [Å]", "largest_cavity_diameter [A]"
+    ],
+    "pld [Å]": [
+        "pld [Å]", "PLD [Å]", "pld [A]", "PLD [A]", "pore_limiting_diameter [Å]", "pore_limiting_diameter [A]"
+    ]
+}
+
+CORE_FEATURE_KEYS = [
+    "density [g/cm³]",
+    "asa_grav [m²/g]",
+    "asa_vol [m²/cm³]",
+    "av_vf",
+    "pore_volume [cm³/g]",
+    "lcd [Å]",
+    "pld [Å]"
+]
+
+# -------------------- Utilities --------------------
+def sanitize_name(s: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_\-\.]+", "_", s)
+
+def resolve_first_present(df: pd.DataFrame, candidates: list) -> str | None:
+    for c in candidates:
+        if c in df.columns:
+            return c
+    return None
+
+def collect_features(df: pd.DataFrame, feature_keys: list, aliases_map: dict) -> list:
+    present_cols = []
+    for key in feature_keys:
+        if key in df.columns:
+            present_cols.append(key)
+            continue
+        alias = resolve_first_present(df, aliases_map.get(key, []))
+        if alias is not None:
+            if alias != key:
+                df[key] = df[alias]
+            present_cols.append(key)
+        else:
+            # keep key to trigger helpful error later
+            present_cols.append(key)
+    return present_cols
+
+def build_equation(target_name, intercept, feature_names_poly, coefs):
+    terms = [f"{intercept:.6g}"]
+    for name, coef in zip(feature_names_poly[1:], coefs[1:]):  # skip bias term
+        if abs(coef) < 1e-12:
+            continue
+        sign = " + " if coef >= 0 else " - "
+        terms.append(f"{sign}{abs(coef):.6g}*({name})")
+    return f"{target_name} ≈ " + "".join(terms)
+
+def pearson_manual(x: np.ndarray, y: np.ndarray) -> float:
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    xbar, ybar = x.mean(), y.mean()
+    cov = np.mean((x - xbar) * (y - ybar))
+    stdx = x.std(ddof=0)
+    stdy = y.std(ddof=0)
+    if stdx == 0 or stdy == 0:
+        return np.nan
+    return cov / (stdx * stdy)
+
+# ---------- Plot helpers ----------
+def wb_plot_pearson_bar(corr_series: pd.Series, title="Pearson correlation vs target"):
+    corr_sorted = corr_series.sort_values(key=lambda s: s.abs(), ascending=False)
+    plt.figure()
+    plt.bar(range(len(corr_sorted)), corr_sorted.values)
+    plt.xticks(range(len(corr_sorted)), corr_sorted.index, rotation=45, ha="right")
+    plt.ylabel("Pearson r")
+    plt.title(title)
+    plt.tight_layout()
+    plt.show()
+
+def wb_plot_heatmap(df_corr: pd.DataFrame, title="Correlation heatmap"):
+    plt.figure()
+    im = plt.imshow(df_corr.values, aspect="auto", interpolation="nearest")
+    plt.colorbar(im, fraction=0.046, pad=0.04)
+    plt.xticks(range(df_corr.shape[1]), df_corr.columns, rotation=45, ha="right")
+    plt.yticks(range(df_corr.shape[0]), df_corr.index)
+    plt.title(title)
+    plt.tight_layout()
+    plt.show()
+
+def wb_plot_scatter_with_fit(x, y, xlabel, ylabel):
+    coef = np.polyfit(x, y, 1)
+    xp = np.linspace(np.min(x), np.max(x), 100)
+    yp = np.polyval(coef, xp)
+    plt.figure()
+    plt.scatter(x, y, s=14)
+    plt.plot(xp, yp)
+    plt.xlabel(xlabel)
+    plt.ylabel(ylabel)
+    plt.title(f"{ylabel} vs {xlabel}")
+    plt.tight_layout()
+    plt.show()
+
+# -------------------- White-box Model (per-target) --------------------
+def run_whitebox_for_target(df: pd.DataFrame, target_col: str) -> None:
+    if target_col not in df.columns:
+        raise ValueError(f"Target '{target_col}' not found in the file.")
+
+    selected = collect_features(df, CORE_FEATURE_KEYS, FEATURE_ALIASES)
+
+    missing = [name for name in selected if name not in df.columns]
+    if missing:
+        alias_info = "\n".join([f"- {k}: {v}" for k, v in FEATURE_ALIASES.items()])
+        raise ValueError(
+            f"The following columns are missing or not recognized for target '{target_col}':\n"
+            + ", ".join(missing)
+            + "\n\nCheck column spelling in the input file.\nSupported aliases:\n"
+            + alias_info
+        )
+
+    features = selected
+    data = df[features + [target_col]].select_dtypes(include=[np.number]).dropna()
+    if data.empty:
+        raise ValueError("No valid numeric data after dropna. Check missing values and column formats.")
+
+    X = data[features].values
+    y = data[target_col].values
+
+    Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=TEST_SIZE, random_state=RANDOM_STATE)
+
+    poly = PolynomialFeatures(degree=DEGREE, include_bias=True)
+    Xtr_poly = poly.fit_transform(Xtr)
+    Xte_poly = poly.transform(Xte)
+
+    lr = LinearRegression()
+    lr.fit(Xtr_poly, ytr)
+
+    ytrp = lr.predict(Xtr_poly); ytep = lr.predict(Xte_poly)
+    mae_tr = mean_absolute_error(ytr, ytrp)
+    rmse_tr = mean_squared_error(ytr, ytrp) ** 0.5
+    r2_tr = r2_score(ytr, ytrp)
+    mae_te = mean_absolute_error(yte, ytep)
+    rmse_te = mean_squared_error(yte, ytep) ** 0.5
+    r2_te = r2_score(yte, ytep)
+
+    feat_poly_names = poly.get_feature_names_out(features)
+    # Concatenate 0 for bias to align with build_equation skipping bias
+    equation = build_equation(target_col, lr.intercept_, feat_poly_names, np.concatenate(([0.0], lr.coef_[1:])))
+
+    # Save TXT/CSV artifacts per-target
+    tname = sanitize_name(target_col)
+    (OUTDIR / f"whitebox_equation__{tname}.txt").write_text(
+        f"White-box polynomial model (degree={DEGREE}) for target: {target_col}\n\n"
+        f"Features: {features}\n\n"
+        f"Equation:\n{equation}\n\n"
+        "Metrics:\n"
+        f"- Train: MAE={mae_tr:.4f}, RMSE={rmse_tr:.4f}, R^2={r2_tr:.4f}\n"
+        f"- Test : MAE={mae_te:.4f}, RMSE={rmse_te:.4f}, R^2={r2_te:.4f}\n"
+        "(NOTE: 80/20 split, random_state=42)\n"
+    )
+
+    pd.DataFrame({
+        "term": feat_poly_names,
+        "coefficient": np.concatenate(([lr.intercept_], lr.coef_[1:]))
+    }).to_csv(OUTDIR / f"whitebox_coefficients__{tname}.csv", index=False)
+
+    pearson_pandas = {f: data[f].corr(data[target_col]) for f in features}
+    pd.Series(pearson_pandas, name="pearson_corr").to_csv(OUTDIR / f"pearson_correlations__{tname}.csv")
+    pearson_manual_dict = {f: pearson_manual(data[f].values, data[target_col].values) for f in features}
+    pd.Series(pearson_manual_dict, name="pearson_corr_manual").to_csv(OUTDIR / f"pearson_correlations_manual__{tname}.csv")
+
+    # SHOW plots directly
+    wb_plot_pearson_bar(pd.Series(pearson_pandas), title=f"Pearson correlation with {target_col}")
+    corr_mat = data[features + [target_col]].corr()
+    wb_plot_heatmap(corr_mat, title=f"Correlation heatmap (features + {target_col})")
+    top_by_abs = pd.Series(pearson_pandas).abs().sort_values(ascending=False).index[:TOP_SCATTER]
+    for f in top_by_abs:
+        wb_plot_scatter_with_fit(data[f].values, data[target_col].values, xlabel=f, ylabel=target_col)
+
+    # Predicted vs Actual (rainbow optional)
+    plt.figure()
+    if USE_RAINBOW:
+        plt.scatter(yte, ytep, c=yte, cmap="rainbow", s=18)
+    else:
+        plt.scatter(yte, ytep, s=18)
+    plt.xlabel(f"Actual {target_col} (test)")
+    plt.ylabel("Predicted")
+    plt.title(f"Predicted vs Actual (White-box polynomial, {target_col}, degree={DEGREE})")
+    mn, mx = float(np.min([yte.min(), ytep.min()])), float(np.max([yte.max(), ytep.max()]))
+    plt.plot([mn, mx], [mn, mx])
+    plt.tight_layout()
+    plt.show()
+
+    print(f"\n=== WHITE-BOX MOF MODEL ({target_col}) ===")
+    print("Features used:", features)
+    print(f"Train: MAE={mae_tr:.4f}, RMSE={rmse_tr:.4f}, R^2={r2_tr:.4f}")
+    print(f"Test : MAE={mae_te:.4f}, RMSE={rmse_te:.4f}, R^2={r2_te:.4f}")
+    print("Equation (snippet):")
+    print(textwrap.shorten(equation, width=160, placeholder=" ..."))
+    print("\nSaved files:")
+    print("-", (OUTDIR / f"whitebox_equation__{tname}.txt").resolve())
+    print("-", (OUTDIR / f"whitebox_coefficients__{tname}.csv").resolve())
+    print("-", (OUTDIR / f"pearson_correlations__{tname}.csv").resolve())
+    print("-", (OUTDIR / f"pearson_correlations_manual__{tname}.csv").resolve())
+
+# -------------------- DOE Screening --------------------
+def run_doe_screening(df: pd.DataFrame) -> None:
+    if GRAV_COL not in df.columns:
+        raise AssertionError(f"Column '{GRAV_COL}' not found in the file.")
+    if VOL_COL not in df.columns:
+        raise AssertionError(f"Column '{VOL_COL}' not found in the file.")
+
+    df_filtered = df.dropna(subset=[GRAV_COL, VOL_COL]).copy()
+    print(f"Total rows (all): {len(df):,}")
+    print(f"Total rows (with {GRAV_COL} & {VOL_COL}): {len(df_filtered):,}")
+
+    meets_grav = df_filtered[GRAV_COL] >= DOE_TARGET_GRAV
+    meets_vol  = df_filtered[VOL_COL]  >= DOE_TARGET_VOL
+    df_screened = df_filtered[meets_grav & meets_vol].copy()
+    print(f"Number of MOFs meeting both DOE targets (working capacity): {len(df_screened):,}")
+
+    # Save screened table to the same OUTDIR
+    xlsx_path = OUTDIR / "mofs_meet_doe_working_capacity.xlsx"
+    df_screened.to_excel(xlsx_path, index=False)
+    print("Excel saved at:", xlsx_path.resolve())
+
+    # DOE scatter: show (do not save PNG)
+    plt.figure(figsize=(8, 6))
+    plt.scatter(df_filtered[GRAV_COL], df_filtered[VOL_COL], alpha=0.5, label="All MOFs")
+    if not df_screened.empty:
+        plt.scatter(df_screened[GRAV_COL], df_screened[VOL_COL], alpha=0.9, label="Meets DOE Targets")
+    plt.axvline(DOE_TARGET_GRAV, linestyle="--", label=f"DOE Gravimetric Target ({DOE_TARGET_GRAV} wt%)")
+    plt.axhline(DOE_TARGET_VOL,  linestyle="--", label=f"DOE Volumetric Target ({DOE_TARGET_VOL} g H₂/L)")
+    plt.xlabel("Working Capacity (Gravimetric) [wt.%]")
+    plt.ylabel("Working Capacity (Volumetric) [g H₂/L]")
+    plt.title("MOF Screening vs DOE 2025 Targets (Working Capacity)")
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    if DOE_SHOW_PLOTS:
+        plt.show()
+    else:
+        plt.savefig(OUTDIR / "doe_screening_scatter_working_capacity.png", dpi=200)
+        plt.close()
+
+    # Optional Colab download
+    try:
+        from google.colab import files  # type: ignore
+        files.download(str(xlsx_path))
+    except Exception:
+        pass
+
+# -------------------- Main Orchestrator --------------------
+def main():
+    df = pd.read_excel(FILE_PATH)
+
+    # Normalize/alias feature columns early
+    _ = collect_features(df, CORE_FEATURE_KEYS, FEATURE_ALIASES)
+
+    # Run white-box per target
+    for tgt in TARGETS:
+        run_whitebox_for_target(df, tgt)
+
+    # Run DOE screening based on working capacities
+    run_doe_screening(df)
+
+if __name__ == "__main__":
+    main()
